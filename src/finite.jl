@@ -91,7 +91,97 @@ function enlarge_block(block::Block{Nc}, widthmax, signfactor, comm, rank, Ncpu,
     end
 
     if rank == 0
-        fac2 = (Nc ^ 2 - 1) / sqrt(Nc) * signfactor
+        dp = [directproduct(βs[j], fundairrep) for j in 1 : lenβ]
+        Utask = map([(i, j) for i in 1 : lenβ, j in 1 : lenβ]) do (i, j)
+            Threads.@spawn begin
+                o1 = get(dp[j], βs[i], 0)
+                map(1 : o1) do τ1
+                    rtn = zeros(ComplexF64, ms[i], ms[j])
+                    for k in 1 : lenα
+                        if αs[k] == βs[j] && αs[k] != βs[i] && αβmatrix[k, i] && αβmatrix[k, j] # fix later
+                            for l in 1 : mαβ[k, i]
+                                rtn[cum_mαβ[k, i] + l, cum_mαβ[k, j] + l] = 1.0
+                            end
+                        end
+                    end
+                    sparse(rtn)
+                end
+            end
+        end
+        Utemp = fetch.(Utask)
+        MPI.bcast(ms, 0, comm)
+        om = length.(Utemp)
+        MPI.bcast(om, 0, comm)
+    else
+        ms = MPI.bcast(nothing, 0, comm)
+        lenβ = length(ms)
+        om = MPI.bcast(nothing, 0, comm)
+        Utemp = [[spzeros(ComplexF64, ms[i], ms[j]) for τ1 in 1 : om[i, j]] for i in 1 : lenβ, j in 1 : lenβ]
+    end
+
+    for i in 1 : lenβ, j in 1 : lenβ
+        for τ1 in 1 : om[i, j]
+            if rank == 0
+                MPI.bcast(Utemp[i, j][τ1], 0, comm)
+            else
+                Utemp[i, j][τ1] .= MPI.bcast(nothing, 0, comm)
+            end
+        end
+    end
+
+    if gpu
+        Unew = [CUSPARSE.CuSparseMatrixCSC.(Utemp[i, j]) for i in 1 : lenβ, j in 1 : lenβ]
+    else
+        Unew = Utemp
+    end
+
+    if rank == 0
+        dp = [directproduct(βs[j], antiirrep) for j in 1 : lenβ]
+        Dtask = map([(i, j) for i in 1 : lenβ, j in 1 : lenβ]) do (i, j)
+            Threads.@spawn begin
+                o1 = get(dp[j], βs[i], 0)
+                map(1 : o1) do τ1
+                    rtn = zeros(ComplexF64, ms[i], ms[j])
+                    for k in 1 : lenα
+                        if αs[k] == βs[i] && αs[k] != βs[j] && αβmatrix[k, i] && αβmatrix[k, j] # fix later
+                            for l in 1 : mαβ[k, i]
+                                rtn[cum_mαβ[k, i] + l, cum_mαβ[k, j] + l] = 1.0
+                            end
+                        end
+                    end
+                    sparse(rtn)
+                end
+            end
+        end
+        Dtemp = fetch.(Dtask)
+        MPI.bcast(ms, 0, comm)
+        om = length.(Dtemp)
+        MPI.bcast(om, 0, comm)
+    else
+        ms = MPI.bcast(nothing, 0, comm)
+        lenβ = length(ms)
+        om = MPI.bcast(nothing, 0, comm)
+        Dtemp = [[spzeros(ComplexF64, ms[i], ms[j]) for τ1 in 1 : om[i, j]] for i in 1 : lenβ, j in 1 : lenβ]
+    end
+
+    for i in 1 : lenβ, j in 1 : lenβ
+        for τ1 in 1 : om[i, j]
+            if rank == 0
+                MPI.bcast(Dtemp[i, j][τ1], 0, comm)
+            else
+                Dtemp[i, j][τ1] .= MPI.bcast(nothing, 0, comm)
+            end
+        end
+    end
+
+    if gpu
+        Dnew = [CUSPARSE.CuSparseMatrixCSC.(Dtemp[i, j]) for i in 1 : lenβ, j in 1 : lenβ]
+    else
+        Dnew = Dtemp
+    end
+
+    if rank == 0
+        fac2 = 0.0 # (Nc ^ 2 - 1) / sqrt(Nc) * signfactor
         # fac4 = 1.0
         Htask = map(1 : lenβ) do k
             Threads.@spawn begin
@@ -150,9 +240,9 @@ function enlarge_block(block::Block{Nc}, widthmax, signfactor, comm, rank, Ncpu,
     end
 
     if rank == 0
-        block_enl = EnlargedBlock(block.length + 1, αs, copy(block.mβ_list_old), βs, ms, mαβ, Dict{Symbol, Vector{AbstractMatrix{ComplexF64}}}(:H => Hnew), Dict{Symbol, Matrix{Vector{AbstractMatrix{ComplexF64}}}}(:conn_S => Snew))
+        block_enl = EnlargedBlock(block.length + 1, αs, copy(block.mβ_list_old), βs, ms, mαβ, Dict{Symbol, Vector{AbstractMatrix{ComplexF64}}}(:H => Hnew), Dict{Symbol, Matrix{Vector{AbstractMatrix{ComplexF64}}}}(:conn_S => Snew, :conn_U => Unew, :conn_D => Dnew))
     else
-        block_enl = EnlargedBlock(block.length + 1, SUNIrrep{Nc}[], Int64[], SUNIrrep{Nc}[], Int64[], zeros(Int64, 0, 0), Dict{Symbol, Vector{AbstractMatrix{ComplexF64}}}(:H => Hnew), Dict{Symbol, Matrix{Vector{AbstractMatrix{ComplexF64}}}}(:conn_S => Snew))
+        block_enl = EnlargedBlock(block.length + 1, SUNIrrep{Nc}[], Int64[], SUNIrrep{Nc}[], Int64[], zeros(Int64, 0, 0), Dict{Symbol, Vector{AbstractMatrix{ComplexF64}}}(:H => Hnew), Dict{Symbol, Matrix{Vector{AbstractMatrix{ComplexF64}}}}(:conn_S => Snew, :conn_U => Unew, :conn_D => Dnew))
     end
 
     block_enl
@@ -206,6 +296,44 @@ function dmrg_step(sys_enl::EnlargedBlock{Nc}, env_enl::EnlargedBlock{Nc}, m, wi
         end
     end
 
+    for k1 in 1 : sys_len, k2 in 1 : env_len
+        if T[k1, k2]
+            miniblock = Tuple{ComplexF64, AbstractMatrix{ComplexF64}, AbstractMatrix{ComplexF64}, Int64, Int64}[]
+            for k3 in 1 : sys_len, k4 in 1 : env_len
+                if T[k3, k4] && (k3 + k4 - 2) % Ncpu == rank
+                    syssector = sys_enl.tensor_dict[:conn_U][k3, k1]
+                    o1 = length(syssector)
+                    envsector = env_enl.tensor_dict[:conn_D][k4, k2]
+                    o2 = length(envsector)
+                    if o1 == 1 && o2 == 1
+                        cmatrix = tables[5][sys_βs[k1], sys_βs[k3], env_βs[k4], γirrep, env_βs[k2]]
+                        push!(miniblock, (cmatrix[1, 1], syssector[1], envsector[1], k3, k4))
+                    end
+                end
+            end
+            push!(superblock_H2, (miniblock, k1, k2, sys_ms[k1], env_ms[k2]))
+        end
+    end
+
+    for k1 in 1 : sys_len, k2 in 1 : env_len
+        if T[k1, k2]
+            miniblock = Tuple{ComplexF64, AbstractMatrix{ComplexF64}, AbstractMatrix{ComplexF64}, Int64, Int64}[]
+            for k3 in 1 : sys_len, k4 in 1 : env_len
+                if T[k3, k4] && (k3 + k4 - 2) % Ncpu == rank
+                    syssector = sys_enl.tensor_dict[:conn_D][k3, k1]
+                    o1 = length(syssector)
+                    envsector = env_enl.tensor_dict[:conn_U][k4, k2]
+                    o2 = length(envsector)
+                    if o1 == 1 && o2 == 1
+                        cmatrix = tables[5][env_βs[k2], env_βs[k4], sys_βs[k3], γirrep, sys_βs[k1]]
+                        push!(miniblock, (cmatrix[1, 1], syssector[1], envsector[1], k3, k4))
+                    end
+                end
+            end
+            push!(superblock_H2, (miniblock, k1, k2, sys_ms[k1], env_ms[k2]))
+        end
+    end
+
     if isnothing(Ψ0_guess)
         if gpu
             initial = [[CUDA.rand(ComplexF64, env_ms[ki], sys_ms[kj]) for J in 1 : (T[kj, ki] && (kj + ki - 2) % Ncpu == rank)] for ki in 1 : env_len, kj in 1 : sys_len]
@@ -240,8 +368,6 @@ function dmrg_step(sys_enl::EnlargedBlock{Nc}, env_enl::EnlargedBlock{Nc}, m, wi
                 @. Ψout[rightout, leftout][1] += coeff * temp4
             end
         end
-
-
     end
 
     balancer = zeros(Int64, sys_len)
@@ -270,7 +396,7 @@ function dmrg_step(sys_enl::EnlargedBlock{Nc}, env_enl::EnlargedBlock{Nc}, m, wi
     end
     MPI.Bcast!(balancer, 0, comm)
 
-    energy = E #+ (sys_enl.length + env_enl.length - 1) / Nc
+    energy = E + 1.0 / Nc #+ (sys_enl.length + env_enl.length - 1) / Nc # fix later
     dimβ = dim.(sys_βs)
     ρs = Matrix{ComplexF64}[]
 
@@ -346,7 +472,9 @@ function dmrg_step(sys_enl::EnlargedBlock{Nc}, env_enl::EnlargedBlock{Nc}, m, wi
         println("Keeping ", sum(msnew), " SU($Nc) states corresponding to ", sum(dimβ .* msnew), " U(1) states")
         Hnew = map(k -> size(transformation_matrix[k], 2) == 0 ? zeros(ComplexF64, 0, 0) : Array(transpose(transformation_matrix[k]) * (sys_enl.scalar_dict[:H][k] * conj.(transformation_matrix[k]))), 1 : sys_len)
         Snew = map(k -> [size(transformation_matrix[k[2]], 2) == 0 ? zeros(ComplexF64, size(transformation_matrix[k[1]], 2), 0) : Array(transpose(transformation_matrix[k[1]]) * (M * conj.(transformation_matrix[k[2]]))) for M in sys_enl.tensor_dict[:conn_S][k...]], [(ki, kj) for ki in 1 : sys_len, kj in 1 : sys_len])
-        newblock = Block(sys_enl.length, sys_enl.β_list, sys_enl.mβ_list, msnew, Dict{Symbol, Vector{Matrix{ComplexF64}}}(:H => Hnew), Dict{Symbol, Matrix{Vector{Matrix{ComplexF64}}}}(:conn_S => Snew))
+        Unew = map(k -> [size(transformation_matrix[k[2]], 2) == 0 ? zeros(ComplexF64, size(transformation_matrix[k[1]], 2), 0) : Array(transpose(transformation_matrix[k[1]]) * (M * conj.(transformation_matrix[k[2]]))) for M in sys_enl.tensor_dict[:conn_U][k...]], [(ki, kj) for ki in 1 : sys_len, kj in 1 : sys_len])
+        Dnew = map(k -> [size(transformation_matrix[k[2]], 2) == 0 ? zeros(ComplexF64, size(transformation_matrix[k[1]], 2), 0) : Array(transpose(transformation_matrix[k[1]]) * (M * conj.(transformation_matrix[k[2]]))) for M in sys_enl.tensor_dict[:conn_D][k...]], [(ki, kj) for ki in 1 : sys_len, kj in 1 : sys_len])
+        newblock = Block(sys_enl.length, sys_enl.β_list, sys_enl.mβ_list, msnew, Dict{Symbol, Vector{Matrix{ComplexF64}}}(:H => Hnew), Dict{Symbol, Matrix{Vector{Matrix{ComplexF64}}}}(:conn_S => Snew, :conn_U => Unew, :conn_D => Dnew))
     else
         newblock = Block(sys_enl.length, SUNIrrep{Nc}[], Int64[], Int64[], Dict{Symbol, Vector{Matrix{ComplexF64}}}(), Dict{Symbol, Matrix{Vector{Matrix{ComplexF64}}}}())
         transformation_matrix = nothing
@@ -438,7 +566,11 @@ function finite_system_algorithm(Nc, L, m_warmup, m_sweep_list, widthmax, target
         H1 = [zeros(ComplexF64, 1, 1), zeros(ComplexF64, 1, 1)]
         S1 = [Matrix{ComplexF64}[] for i in 1 : 2, j in 1 : 2]
         S1[1, 1] = [ones(ComplexF64, 1, 1) .* sqrt((Nc ^ 2 - 1) / Nc)]
-        block = Block(1, β1, [1, 1], [1, 1], Dict{Symbol, Vector{Matrix{ComplexF64}}}(:H => H1), Dict{Symbol, Matrix{Vector{Matrix{ComplexF64}}}}(:conn_S => S1))
+        U1 = [Matrix{ComplexF64}[] for i in 1 : 2, j in 1 : 2]
+        U1[1, 2] = [ones(ComplexF64, 1, 1)]
+        D1 = [Matrix{ComplexF64}[] for i in 1 : 2, j in 1 : 2]
+        D1[2, 1] = [ones(ComplexF64, 1, 1)]
+        block = Block(1, β1, [1, 1], [1, 1], Dict{Symbol, Vector{Matrix{ComplexF64}}}(:H => H1), Dict{Symbol, Matrix{Vector{Matrix{ComplexF64}}}}(:conn_S => S1, :conn_U => U1, :conn_D => D1))
         trmat = [diagm([one(ComplexF64)]), diagm([one(ComplexF64)])]
 
         if fileio
@@ -624,7 +756,7 @@ function finite_system_algorithm(Nc, L, m_warmup, m_sweep_list, widthmax, target
             #             l = findfirst(isequal(βl), sys_βs)
             #             if !isnothing(l) && (i + l - 2) % Ncpu == rank && sys_mαβ[j, l] > 0
             #                 temp3 = env_trmat[i] * temp2[cum_env_mαβ[i, k] + 1 : cum_env_mαβ[i + 1, k], :]
-            #                 @. Ψ0_guess[i, l][1][:, cum_sys_mαβ[j, l] + 1 : cum_sys_mαβ[j + 1, l]] += tables[5][αj, βl, αi, γirrep, βk] * temp3 # fix later
+            #                 @. Ψ0_guess[i, l][1][:, cum_sys_mαβ[j, l] + 1 : cum_sys_mαβ[j + 1, l]] += tables[5][αj, βl, αi, γirrep, βk] * temp3
             #             end
             #         end
             #     end
